@@ -1,0 +1,1346 @@
+"use strict";
+
+let kmcPerformanceMap = null;
+let kmcPerformanceMarker = null;
+let kmcPerformanceAutocomplete = null;
+
+window.initializeKmcPerformanceMap = function initializeKmcPerformanceMap() {
+    const mapElement = document.getElementById("performance-location-map");
+    const locationInput = document.getElementById("performance-location");
+    const locationNameInput = document.getElementById("performance-location-name");
+    const locationAddressInput = document.getElementById("performance-location-address");
+    if (!mapElement || !locationInput || !locationNameInput || !locationAddressInput || !window.google?.maps?.places) return;
+
+    kmcPerformanceMap = new google.maps.Map(mapElement, {
+        center: { lat: 34.0522, lng: -118.2437 },
+        zoom: 10,
+        mapTypeControl: false,
+        streetViewControl: false,
+        fullscreenControl: false
+    });
+
+    kmcPerformanceMarker = new google.maps.Marker({ map: kmcPerformanceMap });
+    kmcPerformanceAutocomplete = new google.maps.places.Autocomplete(locationInput, {
+        fields: ["formatted_address", "geometry", "name", "place_id"]
+    });
+
+    kmcPerformanceAutocomplete.addListener("place_changed", () => {
+        const place = kmcPerformanceAutocomplete.getPlace();
+        if (!place.geometry?.location) return;
+
+        const lat = place.geometry.location.lat();
+        const lng = place.geometry.location.lng();
+        const locationName = place.name || place.formatted_address || locationInput.value.trim();
+        const locationAddress = place.formatted_address || "";
+
+        // Show only the venue/place name in the form and across the website.
+        locationInput.value = locationName;
+        locationNameInput.value = locationName;
+        locationAddressInput.value = locationAddress;
+        document.getElementById("performance-location-place-id").value = place.place_id || "";
+        document.getElementById("performance-location-lat").value = String(lat);
+        document.getElementById("performance-location-lng").value = String(lng);
+
+        kmcPerformanceMap.setCenter({ lat, lng });
+        kmcPerformanceMap.setZoom(16);
+        kmcPerformanceMarker.setPosition({ lat, lng });
+    });
+
+    // If the administrator edits the text after choosing a suggestion,
+    // clear the saved Google place details so an outdated address is not stored.
+    locationInput.addEventListener("input", () => {
+        if (locationInput.value === locationNameInput.value) return;
+        locationNameInput.value = "";
+        locationAddressInput.value = "";
+        document.getElementById("performance-location-place-id").value = "";
+        document.getElementById("performance-location-lat").value = "";
+        document.getElementById("performance-location-lng").value = "";
+    });
+};
+
+document.addEventListener("DOMContentLoaded", () => {
+    const { auth, db, storage } = window.kmcFirebase || {};
+    const tools = window.kmcAdminTools;
+    const imageOptimizer = window.kmcImageOptimizer;
+    const get = (id) => document.getElementById(id);
+    const memberReferenceId = (member, index = 0) => {
+        const year = String(member?.service || "").match(/\b(?:19|20)(\d{2})\s*[-–—]/)?.[1];
+        const parts = String(member?.name || "").trim().normalize("NFKD")
+            .replace(/[\u0300-\u036f]/g, "")
+            .split(/\s+/)
+            .map((part) => part.replace(/[^a-z0-9]/gi, "").toLocaleLowerCase())
+            .filter(Boolean);
+        if (!year || !parts.length) return String(member?.id || `legacy-member-${index}`);
+        return `${year}${parts.at(-1)}${parts[0][0]}`;
+    };
+
+    const page = get("performances-admin");
+    const loading = get("performances-loading");
+    const email = get("admin-user-email");
+    const logout = get("admin-logout");
+    const form = get("performance-form");
+    const formTitle = get("performance-form-title");
+    const idInput = get("performance-id");
+    const dateInput = get("performance-date");
+    const hiddenInput = get("performance-hidden");
+    const timeInput = get("performance-time");
+    const timezoneInput = get("performance-timezone");
+    const timeTbd = get("performance-time-tbd");
+    const locationInput = get("performance-location");
+    const locationTbd = get("performance-location-tbd");
+    const arrangementsTbd = get("performance-arrangements-tbd");
+    const arrangementsList = get("performance-arrangements-list");
+    const membersTbd = get("performance-members-tbd");
+    const membersList = get("performance-members-list");
+    const highlightInput = get("performance-highlight");
+    const highlightTbd = get("performance-highlight-tbd");
+    const highlightExisting = get("performance-highlight-existing");
+    const highlightPreviewWrap = get("performance-highlight-preview-wrap");
+    const highlightPreview = get("performance-highlight-preview");
+    const highlightRemove = get("performance-highlight-remove");
+    const galleryUploadLink = get("performance-gallery-upload-link");
+    const galleryList = get("performance-gallery-list");
+    const gallerySummary = get("performance-gallery-summary");
+    const galleryDownloadButton = get("performance-gallery-download");
+    const zipDialog = get("gallery-zip-dialog");
+    const zipYes = get("gallery-zip-yes");
+    const zipNo = get("gallery-zip-no");
+    const zipDownload = get("gallery-zip-download");
+    let zipItems = [], zipRecord = null, zipController = null;
+    let zipBusy = false, zipRun = 0, zipObjectUrl = "";
+    const linksTbd = get("performance-links-tbd");
+    const linksList = get("performance-links-list");
+    const addLinkButton = get("performance-link-add");
+    const submitButton = get("performance-submit");
+    const cancelButton = get("performance-cancel");
+    const status = get("performance-status");
+    const list = get("performance-list");
+    const empty = get("performance-empty");
+    const count = get("performance-count");
+    const modal = get("performance-modal");
+    const modalDialog = modal?.querySelector(".performance-modal-dialog");
+    const modalClose = get("performance-modal-close");
+    const addPerformanceButton = get("performance-add-button");
+    let modalCloseTimer = null;
+    let lastModalTrigger = null;
+
+    let unsubscribePerformances = null;
+    let performanceRecords = [];
+    let memberRecords = [];
+    let arrangementRecords = [];
+    let previewObjectUrl = "";
+    let removeExistingHighlight = false;
+    let galleryItems = [];
+    let pendingGalleryFiles = [];
+    let galleryPathsToDelete = [];
+    let baseGalleryKeys = new Set();
+    let editingRecord = null;
+    let uploadDraftId = "", uploadCodeRequest = 0, codeBackfillRunning = false;
+    const uploadCodes = new Map();
+    const galleryKey = item => item.path || item.url || item.id;
+
+    async function ensureUploadCode(id, draft = false) {
+        if (uploadCodes.has(id)) return uploadCodes.get(id);
+        const result = await window.KMCGalleryUploadAPI.request("codes", { performanceIds: [id], allowDraft: draft }, { admin: true });
+        const code = result.codes[id];
+        if (!/^\d{4}$/.test(code)) throw new Error("An upload code could not be generated.");
+        uploadCodes.set(id, code);
+        return code;
+    }
+    async function showUploadCode() {
+        const request = ++uploadCodeRequest;
+        const id = idInput.value || uploadDraftId;
+        get("performance-upload-code").textContent = "…";
+        get("performance-upload-code-copy").disabled = true;
+        get("performance-upload-code-retry").hidden = true;
+        get("performance-upload-code-status").textContent = "Loading upload code…";
+        try {
+            const code = await ensureUploadCode(id, !idInput.value);
+            if (request !== uploadCodeRequest) return;
+            get("performance-upload-code").textContent = code;
+            get("performance-upload-code-copy").disabled = false;
+            get("performance-upload-code-status").textContent = "Share this code in the group chat.";
+        } catch (error) {
+            if (request !== uploadCodeRequest) return;
+            get("performance-upload-code").textContent = "—";
+            get("performance-upload-code-status").textContent = error.message;
+            get("performance-upload-code-retry").hidden = false;
+        }
+    }
+    async function backfillUploadCodes() {
+        if (codeBackfillRunning) return;
+        const ids = performanceRecords.map(record => record.id).filter(id => !uploadCodes.has(id));
+        if (!ids.length) return;
+        codeBackfillRunning = true;
+        try {
+            for (let index = 0; index < ids.length; index += 50) {
+                const result = await window.KMCGalleryUploadAPI.request("codes", { performanceIds: ids.slice(index, index + 50) }, { admin: true });
+                Object.entries(result.codes).forEach(([id, code]) => uploadCodes.set(id, code));
+            }
+            get("performance-upload-code-backfill").textContent = "";
+        } catch (error) {
+            get("performance-upload-code-backfill").textContent = `Upload codes: ${error.message}`;
+        } finally { codeBackfillRunning = false; }
+    }
+    get("performance-upload-code-retry").addEventListener("click", showUploadCode);
+    get("performance-upload-code-copy").addEventListener("click", async () => {
+        try {
+            await navigator.clipboard.writeText(get("performance-upload-code").textContent);
+            get("performance-upload-code-status").textContent = "Code copied.";
+        } catch (_) { get("performance-upload-code-status").textContent = "Select the code above to copy it."; }
+    });
+    const thumbnailRepairAttempted = new Set();
+    let thumbnailRepairRunning = false;
+
+    const returnToLogin = () => location.replace("/login");
+    if (!auth || !db || !storage) {
+        returnToLogin();
+        return;
+    }
+
+    function setStatus(message = "", type = "") {
+        status.textContent = message;
+        status.className = "login-status";
+        if (type) status.classList.add(`is-${type}`);
+    }
+
+    function releaseZipDownload() {
+        if (!zipObjectUrl) return;
+        const url = zipObjectUrl;
+        zipObjectUrl = "";
+        zipDownload.removeAttribute("href");
+        // Leave time for the browser to take ownership of a triggered download.
+        window.setTimeout(() => URL.revokeObjectURL(url), 60000);
+    }
+
+    function closeZipDialog() {
+        if (window.KMCOverlayHistory?.leave(zipDialog.id)) return;
+        zipController?.abort();
+        zipRun += 1;
+        zipBusy = false;
+        zipDialog.close();
+        releaseZipDownload();
+        galleryDownloadButton.focus({ preventScroll: true });
+    }
+
+    galleryDownloadButton.addEventListener("click", () => {
+        if (submitButton.disabled || zipBusy) return;
+        zipItems = sortGalleryItems([
+            ...galleryItems.map(item => ({ ...item })),
+            ...pendingGalleryFiles.map(item => ({ ...item }))
+        ]);
+        if (!zipItems.length) return;
+        zipRecord = {
+            locationTbd: locationTbd.checked,
+            locationName: get("performance-location-name").value || locationInput.value.trim(),
+            date: dateInput.value
+        };
+        releaseZipDownload();
+        get("gallery-zip-title").textContent = window.KMCGalleryZip?.galleryTitle(zipRecord) || "Download gallery";
+        get("gallery-zip-description").textContent = `Download all ${zipItems.length} gallery files currently listed in this editor as a ZIP?`;
+        get("gallery-zip-description").hidden = false;
+        get("gallery-zip-progress-wrap").hidden = true;
+        get("gallery-zip-status").textContent = "";
+        get("gallery-zip-status").className = "";
+        zipYes.hidden = false;
+        zipYes.textContent = "Yes";
+        zipNo.textContent = "No";
+        zipDownload.hidden = true;
+        window.KMCOverlayHistory?.enter(zipDialog.id, { close: closeZipDialog });
+        zipDialog.showModal();
+        zipNo.focus();
+    });
+
+    zipNo.addEventListener("click", closeZipDialog);
+    zipDialog.addEventListener("cancel", event => {
+        event.preventDefault();
+        if (!zipBusy) closeZipDialog();
+    });
+    zipYes.addEventListener("click", async () => {
+        if (zipBusy) return;
+        const run = ++zipRun;
+        zipBusy = true;
+        zipController = new AbortController();
+        get("gallery-zip-description").hidden = true;
+        get("gallery-zip-progress-wrap").hidden = false;
+        const progress = get("gallery-zip-progress");
+        const progressPercent = get("gallery-zip-percent");
+        const progressCount = get("gallery-zip-count");
+        const progressPhase = get("gallery-zip-phase");
+        const progressStatus = get("gallery-zip-status");
+        progress.value = 0;
+        progressPercent.textContent = "0%";
+        progressCount.textContent = `0 of ${zipItems.length}`;
+        progressPhase.textContent = "Preparing files…";
+        progressStatus.className = "";
+        progressStatus.textContent = "";
+        zipYes.hidden = true;
+        zipNo.textContent = "Cancel";
+        zipNo.focus();
+        try {
+            if (!window.KMCGalleryZip) throw new Error("The ZIP download could not start. Refresh the page and try again.");
+            const blob = await window.KMCGalleryZip.create(zipItems, {
+                storage, signal: zipController.signal,
+                onProgress: ({ processed, total, percent, phase }) => {
+                    if (run !== zipRun) return;
+                    progress.value = percent;
+                    progressPercent.textContent = `${percent}%`;
+                    progressCount.textContent = `${processed} of ${total}`;
+                    progressPhase.textContent = phase === "zip" ? "Preparing ZIP…" : "Processing files…";
+                }
+            });
+            if (run !== zipRun) return;
+            zipObjectUrl = URL.createObjectURL(blob);
+            zipDownload.href = zipObjectUrl;
+            zipDownload.download = window.KMCGalleryZip.filename(zipRecord);
+            zipDownload.hidden = false;
+            zipDownload.click();
+            progress.value = 100;
+            progressPercent.textContent = "100%";
+            progressCount.textContent = `${zipItems.length} of ${zipItems.length}`;
+            progressPhase.textContent = "ZIP ready";
+            progressStatus.textContent = "Complete";
+            progressStatus.className = "is-success";
+            zipNo.textContent = "Done";
+        } catch (error) {
+            if (run !== zipRun || error.name === "AbortError") return;
+            progressStatus.textContent = error.message || "The ZIP could not be prepared. Please try again.";
+            progressStatus.className = "is-error";
+            zipYes.textContent = "Try Again";
+            zipYes.hidden = false;
+            zipNo.textContent = "Close";
+        } finally {
+            if (run === zipRun) zipBusy = false;
+        }
+    });
+    window.addEventListener("beforeunload", event => {
+        if (!zipBusy) return;
+        event.preventDefault();
+        event.returnValue = "";
+    });
+
+    function setGroupDisabled(containerId, disabled) {
+        const container = get(containerId);
+        if (!container) return;
+        container.classList.toggle("fieldset-disabled", disabled);
+        container.querySelectorAll("input, select, button").forEach((field) => {
+            field.disabled = disabled;
+        });
+    }
+
+    function syncTbdStates() {
+        timeInput.disabled = timeTbd.checked;
+        timezoneInput.disabled = timeTbd.checked;
+        setGroupDisabled("performance-location-fields", locationTbd.checked);
+        setGroupDisabled("performance-arrangement-fields", arrangementsTbd.checked);
+        setGroupDisabled("performance-member-fields", membersTbd.checked);
+        setGroupDisabled("performance-highlight-fields", highlightTbd.checked);
+        setGroupDisabled("performance-links-fields", linksTbd.checked);
+    }
+
+    function selectedValues(name) {
+        return [...form.querySelectorAll(`input[name="${name}"]:checked`)].map((input) => input.value);
+    }
+
+    function arrangementLabel(arrangement) {
+        return `${arrangement.name || "Arrangement"} ${arrangement.koreanName || ""}`.trim();
+    }
+
+    function getRecordArrangementIds(record) {
+        if (Array.isArray(record.arrangementIds)) return record.arrangementIds;
+        const legacyNames = Array.isArray(record.arrangements) ? record.arrangements : [];
+        return arrangementRecords
+            .filter((arrangement) => legacyNames.includes(arrangementLabel(arrangement)))
+            .map((arrangement) => arrangement.id);
+    }
+
+    function getRecordArrangementLabels(record) {
+        if (record.arrangementsTbd) return [];
+        const ids = getRecordArrangementIds(record);
+        const resolved = ids.map((id) => arrangementRecords.find((item) => item.id === id))
+            .filter(Boolean)
+            .map(arrangementLabel);
+        if (resolved.length) return resolved;
+        return Array.isArray(record.arrangements) ? record.arrangements : [];
+    }
+
+    function renderArrangementOptions(selectedIds = []) {
+        arrangementsList.replaceChildren();
+        if (!arrangementRecords.length) {
+            const message = document.createElement("p");
+            message.className = "admin-help-text";
+            message.textContent = "No arrangements were found. Add one on the Admin Arrangements page.";
+            arrangementsList.appendChild(message);
+            return;
+        }
+        arrangementRecords.forEach((arrangement) => {
+            const label = document.createElement("label");
+            const checkbox = document.createElement("input");
+            checkbox.type = "checkbox";
+            checkbox.name = "arrangements";
+            checkbox.value = arrangement.id;
+            checkbox.checked = selectedIds.includes(arrangement.id);
+            const span = document.createElement("span");
+            span.textContent = arrangementLabel(arrangement);
+            label.append(checkbox, span);
+            arrangementsList.appendChild(label);
+        });
+    }
+
+    async function loadArrangements() {
+        try {
+            const snapshot = await db.collection("siteContent").doc("arrangements").get();
+            const data = snapshot.exists ? snapshot.data() : {};
+            arrangementRecords = Array.isArray(data.arrangements)
+                ? [...data.arrangements].sort((a, b) => (a.order ?? 0) - (b.order ?? 0))
+                : [];
+        } catch (error) {
+            console.error("Unable to load arrangements:", error);
+            arrangementRecords = [];
+        }
+        renderArrangementOptions();
+    }
+
+    function externalLinks() {
+        return [...linksList.querySelectorAll(".external-link-row")].map((row) => ({
+            label: row.querySelector('[data-field="label"]').value.trim(),
+            url: row.querySelector('[data-field="url"]').value.trim()
+        })).filter((link) => link.label || link.url);
+    }
+
+    function addExternalLink(link = {}) {
+        const row = document.createElement("div");
+        row.className = "external-link-row";
+        row.innerHTML = `
+            <input data-field="label" type="text" maxlength="80" placeholder="Link name" value="${escapeAttribute(link.label || "")}">
+            <input data-field="url" type="url" maxlength="500" placeholder="https://..." value="${escapeAttribute(link.url || "")}">
+            <button class="admin-danger-button admin-small-button" type="button">Remove</button>
+        `;
+        row.querySelector("button").addEventListener("click", () => row.remove());
+        linksList.appendChild(row);
+    }
+
+    function escapeAttribute(value) {
+        return String(value)
+            .replaceAll("&", "&amp;")
+            .replaceAll('"', "&quot;")
+            .replaceAll("<", "&lt;")
+            .replaceAll(">", "&gt;");
+    }
+
+    function getRecordMemberIds(record) {
+        const storedIds = Array.isArray(record.memberIds) ? record.memberIds.map(String) : [];
+        const legacyNames = Array.isArray(record.members) ? record.members : [];
+        return memberRecords
+            .filter(member => storedIds.includes(member.id) || legacyNames.includes(member.name))
+            .map(member => member.id);
+    }
+
+    function renderMembers(selected = []) {
+        membersList.replaceChildren();
+        if (!memberRecords.length) {
+            const message = document.createElement("p");
+            message.className = "admin-help-text";
+            message.textContent = "No members were found. Add members on the Admin Team page.";
+            membersList.appendChild(message);
+            return;
+        }
+        const selectedIds = selected.map(String);
+        memberRecords.forEach((member) => {
+            const label = document.createElement("label");
+            const checkbox = document.createElement("input");
+            checkbox.type = "checkbox";
+            checkbox.name = "members";
+            checkbox.value = member.id;
+            checkbox.checked = selectedIds.includes(member.id) || selectedIds.includes(member.name);
+            const span = document.createElement("span");
+            span.textContent = member.name;
+            label.append(checkbox, span);
+            membersList.appendChild(label);
+        });
+    }
+
+    async function loadMembers() {
+        try {
+            const snapshot = await db.collection("siteContent").doc("team").get();
+            const data = snapshot.exists ? snapshot.data() : {};
+            memberRecords = Array.isArray(data.members) ? [...data.members].sort((a,b)=>(a.order??0)-(b.order??0)).map((member,index)=>({ ...member, id:memberReferenceId(member,index) })) : [];
+        } catch (error) {
+            console.error("Unable to load members:", error);
+            memberRecords = [];
+        }
+        renderMembers();
+    }
+
+    function clearPreview() {
+        if (previewObjectUrl) URL.revokeObjectURL(previewObjectUrl);
+        previewObjectUrl = "";
+        highlightPreview.removeAttribute("src");
+        highlightPreviewWrap.hidden = true;
+    }
+
+    function showPreview(src) {
+        highlightPreview.src = src;
+        highlightPreviewWrap.hidden = false;
+    }
+
+    function isVideoFile(file) {
+        return file?.type === "video" || /^video\//i.test(file?.type || file?.mimeType || "") || /\.(mp4|mov|webm)$/i.test(file?.name || file?.url || "");
+    }
+
+    function sortGalleryItems(items) {
+        return items
+            .map((item, index) => ({ item, index }))
+            .sort((a, b) => {
+                const videoOrder = Number(isVideoFile(b.item)) - Number(isVideoFile(a.item));
+                if (videoOrder) return videoOrder;
+                const nameOrder = String(a.item.name || "").localeCompare(String(b.item.name || ""), undefined, {
+                    numeric: true,
+                    sensitivity: "base"
+                });
+                return nameOrder || a.index - b.index;
+            })
+            .map(({ item }) => item);
+    }
+
+    function getVideoDuration(file) {
+        return new Promise((resolve) => {
+            const video = document.createElement("video");
+            const url = URL.createObjectURL(file);
+            let settled = false;
+            const finish = (duration = 0) => {
+                if (settled) return;
+                settled = true;
+                URL.revokeObjectURL(url);
+                resolve(Number.isFinite(duration) ? Math.round(duration) : 0);
+            };
+            video.preload = "metadata";
+            video.onloadedmetadata = () => finish(video.duration);
+            video.onerror = () => finish();
+            video.src = url;
+            window.setTimeout(() => finish(), 5000);
+        });
+    }
+
+    function createVideoThumbnail(source, item) {
+        return window.KMCVideoPreview.capture(source, {
+            maxEdge: 480, quality: 0.66, jpegQuality: 0.7,
+            resolveSource: item?.path && storage
+                ? () => storage.ref(item.path).getDownloadURL() : undefined
+        });
+    }
+
+    async function createImageThumbnail(source) {
+        if (!imageOptimizer) throw new Error("The image optimizer could not be loaded. Refresh the page and try again.");
+        let blob = source;
+        if (typeof source === "string") {
+            const controller = new AbortController();
+            const timer = window.setTimeout(() => controller.abort(), 30000);
+            try {
+                const response = await fetch(source, { signal: controller.signal });
+                if (!response.ok) throw new Error(`Photo download failed (${response.status}).`);
+                blob = await response.blob();
+                // Older Storage objects can have a generic Content-Type. Use
+                // the file signature rather than rejecting valid image bytes.
+                if (!/^image\//i.test(blob.type)) {
+                    const bytes = new Uint8Array(await blob.slice(0, 12).arrayBuffer());
+                    const mime = bytes[0] === 255 && bytes[1] === 216 ? "image/jpeg"
+                        : bytes[0] === 137 && bytes[1] === 80 && bytes[2] === 78 && bytes[3] === 71 ? "image/png"
+                        : String.fromCharCode(...bytes.slice(0, 4)) === "RIFF" && String.fromCharCode(...bytes.slice(8, 12)) === "WEBP" ? "image/webp" : "";
+                    if (mime) blob = new Blob([blob], { type: mime });
+                }
+            } finally { window.clearTimeout(timer); }
+        }
+        return imageOptimizer.optimize(blob, {
+            maxWidth: 480,
+            maxHeight: 480,
+            quality: 0.66,
+            jpegQuality: 0.7,
+            maxInputBytes: 500 * 1024 * 1024
+        });
+    }
+
+    function blobToDataUrl(blob) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(String(reader.result || ""));
+            reader.onerror = () => reject(new Error("The gallery preview could not be saved."));
+            reader.readAsDataURL(blob);
+        });
+    }
+
+    async function createInlineGalleryThumbnail(thumbnail) {
+        try {
+            const compact = await imageOptimizer.optimize(thumbnail.blob, {
+                maxWidth: 160,
+                maxHeight: 160,
+                quality: 0.45,
+                jpegQuality: 0.5,
+                maxInputBytes: 500 * 1024 * 1024
+            });
+            return blobToDataUrl(compact.blob);
+        } catch (error) {
+            console.warn("The gallery preview could not be compressed further; using the prepared preview:", error);
+            return blobToDataUrl(thumbnail.blob);
+        }
+    }
+
+    async function createExistingGalleryThumbnail(item, { ignoreSavedPreview = false } = {}) {
+        const savedPreview = item.thumbnailUrl || item.thumbnailURL || item.thumbUrl || item.previewUrl || "";
+        if (savedPreview && !ignoreSavedPreview) {
+            try {
+                return await createImageThumbnail(savedPreview);
+            } catch (error) {
+                console.warn("The old gallery preview could not be recovered; rebuilding it from the original media:", error);
+            }
+        }
+        if (isVideoFile(item)) return createVideoThumbnail(item.url, item);
+        try {
+            return await createImageThumbnail(item.url);
+        } catch (error) {
+            if (!item.path || !storage) throw error;
+            const refreshed = await storage.ref(item.path).getDownloadURL();
+            return createImageThumbnail(refreshed);
+        }
+    }
+
+    async function uploadGalleryThumbnail(documentId, thumbnail, token) {
+        // Keep a tiny preview directly with the gallery record. This remains
+        // available even if an older Firebase Storage preview URL expires or
+        // the site's Storage rules have not yet been updated.
+        const thumbnailDataUrl = await createInlineGalleryThumbnail(thumbnail);
+        const path = `performance-highlights/${documentId}/gallery-thumb-${Date.now()}-${token}.${thumbnail.extension}`;
+        const result = {
+            thumbnailDataUrl,
+            thumbnailWidth: Number(thumbnail.width) || 0,
+            thumbnailHeight: Number(thumbnail.height) || 0
+        };
+        try {
+            const snapshot = await storage.ref(path).put(thumbnail.blob, {
+                contentType: thumbnail.contentType,
+                cacheControl: "public,max-age=31536000,immutable"
+            });
+            result.thumbnailUrl = await snapshot.ref.getDownloadURL();
+            result.thumbnailPath = path;
+        } catch (error) {
+            console.warn("The Storage copy of this gallery preview could not be saved; using the embedded lightweight preview instead:", error);
+        }
+        return result;
+    }
+
+    async function ensureGalleryThumbnails(documentId, items, reportProgress = true) {
+        const nextItems = new Array(items.length);
+        let nextIndex = 0;
+        let completed = 0;
+
+        async function prepareNext() {
+            const index = nextIndex++;
+            if (index >= items.length) return;
+            const item = items[index];
+            if (item.thumbnailDataUrl) {
+                nextItems[index] = item;
+            } else {
+                try {
+                    if (reportProgress) setStatus(`Preparing gallery previews… ${completed} of ${items.length} complete`);
+                    const thumbnail = await createExistingGalleryThumbnail(item);
+                    const uploaded = await uploadGalleryThumbnail(documentId, thumbnail, `existing-${index}`);
+                    nextItems[index] = { ...item, ...uploaded };
+                } catch (error) {
+                    console.warn(`Unable to create a preview for ${item.name || "gallery item"}:`, error);
+                    nextItems[index] = item;
+                }
+            }
+            completed += 1;
+            await prepareNext();
+        }
+
+        const workerCount = Math.min(3, items.length);
+        await Promise.all(Array.from({ length: workerCount }, () => prepareNext()));
+        return nextItems;
+    }
+
+    function previewRepairTimeout(task, milliseconds = 45000) {
+        let timer;
+        return Promise.race([
+            Promise.resolve().then(task),
+            new Promise((_, reject) => {
+                timer = window.setTimeout(() => reject(new Error("Preview preparation timed out. Retry this file.")), milliseconds);
+            })
+        ]).finally(() => window.clearTimeout(timer));
+    }
+
+    function usableInlinePreview(value, rejectBlack = false) {
+        if (!/^data:image\/(webp|jpeg|png);base64,/i.test(value || "")) return Promise.resolve(false);
+        return new Promise(resolve => {
+            const image = new Image();
+            const finish = valid => {
+                window.clearTimeout(timer);
+                image.onload = image.onerror = null;
+                image.removeAttribute("src");
+                resolve(valid);
+            };
+            const timer = window.setTimeout(() => finish(false), 5000);
+            image.onload = () => {
+                const valid = image.naturalWidth > 0 && image.naturalHeight > 0;
+                const black = valid && rejectBlack && window.KMCVideoPreview?.isNearlyBlackFrame?.(image);
+                finish(valid && !black);
+            };
+            image.onerror = () => finish(false);
+            image.src = value;
+        });
+    }
+
+    async function repairMissingGalleryThumbnails(records, retry = false) {
+        if (thumbnailRepairRunning) return;
+        thumbnailRepairRunning = true;
+        const button = get("performance-preview-retry");
+        const report = get("performance-preview-report");
+        const details = get("performance-preview-errors");
+        button.disabled = true;
+        details.replaceChildren();
+        let processed = 0, repaired = 0, failed = 0;
+        const jobs = records.filter(record => record.id && (retry || !thumbnailRepairAttempted.has(record.id)))
+            .flatMap(record => (record.galleryItems || []).map(item => ({ record, item })));
+        const update = () => {
+            report.textContent = `Checking previews: ${processed} of ${jobs.length} · ${repaired} repaired · ${failed} failed`;
+        };
+        update();
+        try {
+            // Photos first so slow video decoders cannot block photo repairs.
+            jobs.sort((a, b) => Number(isVideoFile(a.item)) - Number(isVideoFile(b.item)));
+            for (const { record, item } of jobs) {
+                try {
+                    const videoItem = isVideoFile(item);
+                    if (await usableInlinePreview(item.thumbnailDataUrl, videoItem)) continue;
+                    const thumbnail = await previewRepairTimeout(
+                        () => createExistingGalleryThumbnail(item, { ignoreSavedPreview: videoItem }),
+                        videoItem ? 180000 : 90000
+                    );
+                    // Save the compact image directly. An optional Storage upload
+                    // must not block repairing the preview that the public reads.
+                    const thumbnailDataUrl = await previewRepairTimeout(() => createInlineGalleryThumbnail(thumbnail));
+                    if (!await usableInlinePreview(thumbnailDataUrl, videoItem)) throw new Error("The generated preview could not be decoded.");
+                    const fields = { thumbnailDataUrl, thumbnailWidth: thumbnail.width || 0, thumbnailHeight: thumbnail.height || 0 };
+                    const reference = db.collection("performances").doc(record.id);
+                    const didSave = await previewRepairTimeout(() => db.runTransaction(async transaction => {
+                        const snapshot = await transaction.get(reference);
+                        if (!snapshot.exists) return false;
+                        let changed = false;
+                        const merged = (snapshot.data().galleryItems || []).map(current => {
+                            if (current.url !== item.url || current.path !== item.path || current.id !== item.id) return current;
+                            // Keep a preview another save supplied during our work.
+                            if (current.thumbnailDataUrl && current.thumbnailDataUrl !== item.thumbnailDataUrl) return current;
+                            changed = true;
+                            return { ...current, ...fields };
+                        });
+                        if (changed) transaction.update(reference, {
+                            galleryItems: merged, updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+                        });
+                        return changed;
+                    }));
+                    if (didSave) {
+                        repaired += 1;
+                        // Prevent a later Save Changes in an already-open editor
+                        // from overwriting this freshly repaired preview.
+                        if (idInput.value === record.id) galleryItems = galleryItems.map(current =>
+                            current.url === item.url && current.path === item.path && current.id === item.id ? { ...current, ...fields } : current);
+                    }
+                } catch (error) {
+                    failed += 1;
+                    const line = document.createElement("li");
+                    line.textContent = `${record.locationName || record.location || "Performance"} — ${item.name || "Gallery file"}: ${error.code || error.message || "Preview repair failed."}`;
+                    details.appendChild(line);
+                } finally {
+                    processed += 1;
+                    update();
+                }
+            }
+            records.forEach(record => thumbnailRepairAttempted.add(record.id));
+            report.textContent = `Preview check finished: ${processed} checked · ${repaired} repaired · ${failed} failed.`;
+        } finally {
+            thumbnailRepairRunning = false;
+            button.disabled = false;
+        }
+    }
+
+    get("performance-preview-retry").addEventListener("click", async () => {
+        const button = get("performance-preview-retry");
+        button.disabled = true;
+        try {
+            const full = [];
+            for (const record of performanceRecords) {
+                get("performance-preview-report").textContent = `Loading galleries for repair: ${full.length} of ${performanceRecords.length}`;
+                full.push(await window.KMCPerformanceList.detail(record, { fresh: true }));
+            }
+            await repairMissingGalleryThumbnails(full, true);
+        } catch (error) { get("performance-preview-report").textContent = error.message || "Unable to load galleries for repair."; }
+        finally { button.disabled = false; }
+    });
+
+    function renderGalleryFiles() {
+        const performanceId = idInput.value;
+        if (performanceId) {
+            galleryUploadLink.href = `https://kmcgugak.org/upload#${encodeURIComponent(performanceId)}`;
+            galleryUploadLink.removeAttribute("aria-disabled");
+            galleryUploadLink.removeAttribute("tabindex");
+        } else {
+            galleryUploadLink.removeAttribute("href");
+            galleryUploadLink.setAttribute("aria-disabled", "true");
+            galleryUploadLink.setAttribute("tabindex", "-1");
+        }
+        galleryUploadLink.style.opacity = performanceId ? "" : "0.5";
+        get("performance-gallery-upload-help").textContent = performanceId
+            ? "Opens the upload page in a new tab. Enter this performance’s upload code to continue."
+            : "Save this performance first to upload files.";
+        galleryDownloadButton.hidden = !idInput.value;
+        galleryDownloadButton.disabled = submitButton.disabled || !(galleryItems.length + pendingGalleryFiles.length);
+        const items = sortGalleryItems([
+            ...galleryItems.map((item, index) => ({ ...item, source: "saved", index })),
+            ...pendingGalleryFiles.map((item, index) => ({ ...item, source: "pending", index }))
+        ]);
+        const photos = items.filter(item => !isVideoFile(item)).length;
+        const videos = items.length - photos;
+        gallerySummary.textContent = items.length
+            ? `${items.length} item${items.length === 1 ? "" : "s"} · ${photos} photo${photos === 1 ? "" : "s"} · ${videos} video${videos === 1 ? "" : "s"}`
+            : "No gallery items selected.";
+        galleryList.replaceChildren();
+        items.forEach(item => {
+            const row = document.createElement("li");
+            row.className = "performance-gallery-admin-item";
+            const name = document.createElement("span");
+            name.textContent = `${isVideoFile(item) ? "Video" : "Photo"} · ${item.name || "Untitled file"}`;
+            const remove = document.createElement("button");
+            remove.type = "button";
+            remove.className = "admin-danger-button admin-small-button";
+            remove.textContent = "Delete";
+            remove.addEventListener("click", () => {
+                if (item.source === "saved") {
+                    const removed = galleryItems.splice(item.index, 1)[0];
+                    if (removed?.path) galleryPathsToDelete.push(removed.path);
+                    if (removed?.thumbnailPath) galleryPathsToDelete.push(removed.thumbnailPath);
+                } else {
+                    pendingGalleryFiles.splice(item.index, 1);
+                }
+                renderGalleryFiles();
+            });
+            row.append(name, remove);
+            galleryList.appendChild(row);
+        });
+    }
+
+    function openPerformanceModal(trigger = null) {
+        if (window.KMCOverlayHistory?.deferOpen(() => openPerformanceModal(trigger))) return;
+        if (!modal) return;
+
+        window.clearTimeout(modalCloseTimer);
+        window.KMCOverlayHistory?.enter(modal.id, { close: closePerformanceModal, open: () => openPerformanceModal(trigger), duration: 360 });
+        lastModalTrigger = trigger || document.activeElement;
+        modal.hidden = false;
+        modal.setAttribute("aria-hidden", "false");
+        document.body.classList.add("performance-modal-open");
+
+        requestAnimationFrame(() => {
+            modal.classList.remove("is-closing");
+            modal.classList.add("is-open");
+
+            window.setTimeout(() => {
+                if (window.google?.maps && kmcPerformanceMap) {
+                    google.maps.event.trigger(kmcPerformanceMap, "resize");
+
+                    const lat = Number(get("performance-location-lat").value);
+                    const lng = Number(get("performance-location-lng").value);
+
+                    if (Number.isFinite(lat) && Number.isFinite(lng) && lat && lng) {
+                        kmcPerformanceMap.setCenter({ lat, lng });
+                    }
+                }
+
+                dateInput.focus({ preventScroll: true });
+            }, 140);
+        });
+    }
+
+    function closePerformanceModal() {
+        if (window.KMCOverlayHistory?.leave(modal.id)) return;
+        if (!modal || modal.hidden) return;
+
+        modal.classList.remove("is-open");
+        modal.classList.add("is-closing");
+        document.body.classList.remove("performance-modal-open");
+
+        modalCloseTimer = window.setTimeout(() => {
+            modal.hidden = true;
+            modal.classList.remove("is-closing");
+            modal.setAttribute("aria-hidden", "true");
+
+            if (lastModalTrigger && typeof lastModalTrigger.focus === "function") {
+                lastModalTrigger.focus({ preventScroll: true });
+            }
+        }, 360);
+    }
+
+    function trapModalFocus(event) {
+        if (!modalDialog || modal.hidden || event.defaultPrevented || document.querySelector("dialog[open]")) return;
+
+        if (event.key === "Escape") {
+            event.preventDefault();
+            closePerformanceModal();
+            return;
+        }
+
+        if (event.key !== "Tab") return;
+
+        const focusable = [...modalDialog.querySelectorAll(
+            'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), a[href], [tabindex]:not([tabindex="-1"])'
+        )].filter((element) => element.offsetParent !== null);
+
+        if (!focusable.length) return;
+
+        const first = focusable[0];
+        const last = focusable[focusable.length - 1];
+
+        if (event.shiftKey && document.activeElement === first) {
+            event.preventDefault();
+            last.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+            event.preventDefault();
+            first.focus();
+        }
+    }
+
+    function resetForm() {
+        uploadCodeRequest++;
+        uploadDraftId = db.collection("performances").doc().id;
+        baseGalleryKeys = new Set();
+        editingRecord = null;
+        form.reset();
+        idInput.value = "";
+        highlightExisting.value = "";
+        get("performance-location-name").value = "";
+        get("performance-location-address").value = "";
+        get("performance-location-place-id").value = "";
+        get("performance-location-lat").value = "";
+        get("performance-location-lng").value = "";
+        removeExistingHighlight = false;
+        galleryItems = [];
+        pendingGalleryFiles = [];
+        galleryPathsToDelete = [];
+        renderGalleryFiles();
+        clearPreview();
+        linksList.replaceChildren();
+        addExternalLink();
+        renderMembers();
+        renderArrangementOptions();
+        formTitle.textContent = "Add Performance";
+        submitButton.textContent = "Add Performance";
+        cancelButton.hidden = true;
+        setStatus();
+        syncTbdStates();
+    }
+
+    function formatDate(dateValue) {
+        if (!dateValue) return "Date unavailable";
+        const date = new Date(`${dateValue}T12:00:00`);
+        if (Number.isNaN(date.getTime())) return dateValue;
+        return new Intl.DateTimeFormat("en-US", { month: "long", day: "numeric", year: "numeric" }).format(date);
+    }
+
+    function formatTime(record) {
+        if (record.timeTbd) return "Time TBD";
+        if (!record.time) return "Time unavailable";
+        const [hour, minute] = record.time.split(":").map(Number);
+        const date = new Date(2000, 0, 1, hour, minute);
+        return new Intl.DateTimeFormat("en-US", { hour: "numeric", minute: "2-digit" }).format(date);
+    }
+
+    function createPerformanceCard(record) {
+        const article = document.createElement("article");
+        article.className = "performance-admin-card";
+        article.classList.toggle("is-hidden-performance", record.hidden === true);
+
+        const main = document.createElement("div");
+        main.className = "performance-admin-card-main";
+
+        if (record.highlightPhotoUrl) {
+            const image = document.createElement("img");
+            image.loading = "lazy";
+            image.decoding = "async";
+            image.className = "performance-admin-photo";
+            image.src = record.highlightPhotoUrl;
+            image.alt = "";
+            main.appendChild(image);
+        }
+
+        const content = document.createElement("div");
+        content.className = "performance-admin-card-content";
+        const date = document.createElement("p");
+        date.className = "performance-admin-date";
+        date.textContent = `${formatDate(record.date)} · ${formatTime(record)}`;
+        const location = document.createElement("h3");
+        location.textContent = record.locationTbd
+            ? "Location TBD"
+            : record.locationName || record.location || "Location unavailable";
+        const arrangements = document.createElement("p");
+        arrangements.className = "performance-admin-arrangements";
+        const arrangementLabels = getRecordArrangementLabels(record);
+        arrangements.textContent = record.arrangementsTbd ? "Arrangements TBD" : (arrangementLabels.join(" · ") || "No arrangements selected");
+        content.append(date, location, arrangements);
+        main.appendChild(content);
+
+        const actions = document.createElement("div");
+        actions.className = "performance-card-actions";
+        const editButton = document.createElement("button");
+        editButton.type = "button";
+        editButton.className = "admin-secondary-button admin-small-button";
+        editButton.textContent = "Edit";
+        editButton.addEventListener("click", () => beginEdit(record, editButton));
+        const deleteButton = document.createElement("button");
+        deleteButton.type = "button";
+        deleteButton.className = "admin-danger-button admin-small-button";
+        deleteButton.textContent = "Delete";
+        deleteButton.addEventListener("click", () => deletePerformance(record));
+        actions.append(editButton, deleteButton);
+        if (record.hidden === true) {
+            const hiddenBadge = document.createElement("span");
+            hiddenBadge.className = "performance-hidden-badge";
+            hiddenBadge.textContent = "HIDDEN";
+            hiddenBadge.setAttribute("aria-label", "Hidden from the public performance list");
+            article.append(hiddenBadge);
+        }
+        article.append(main, actions);
+        return article;
+    }
+
+    function renderPerformances() {
+        list.replaceChildren();
+        count.textContent = String(performanceRecords.length);
+        empty.hidden = performanceRecords.length !== 0;
+        performanceRecords.forEach((record) => list.appendChild(createPerformanceCard(record)));
+        backfillUploadCodes();
+    }
+
+    async function beginEdit(record, trigger) {
+        if (trigger) { trigger.disabled = true; trigger.textContent = "Loading…"; }
+        try { record = await window.KMCPerformanceList.detail(record, { fresh: true }); }
+        catch (error) { get("performance-preview-report").textContent = error.message || "Unable to load performance."; return; }
+        finally { if (trigger) { trigger.disabled = false; trigger.textContent = "Edit"; } }
+        resetForm();
+        idInput.value = record.id;
+        editingRecord = record;
+        showUploadCode();
+        dateInput.value = record.date;
+        hiddenInput.checked = record.hidden === true;
+        timeInput.value = record.time || "";
+        timezoneInput.value = record.timezone || "America/Los_Angeles";
+        timeTbd.checked = Boolean(record.timeTbd);
+        locationTbd.checked = Boolean(record.locationTbd);
+        const savedLocationName = record.locationName || record.location || "";
+        locationInput.value = savedLocationName;
+        get("performance-location-name").value = savedLocationName;
+        get("performance-location-address").value = record.locationAddress || "";
+        get("performance-location-place-id").value = record.locationPlaceId || "";
+        get("performance-location-lat").value = record.locationLat ?? "";
+        get("performance-location-lng").value = record.locationLng ?? "";
+        arrangementsTbd.checked = Boolean(record.arrangementsTbd);
+        membersTbd.checked = Boolean(record.membersTbd);
+        highlightTbd.checked = Boolean(record.highlightTbd);
+        linksTbd.checked = Boolean(record.linksTbd);
+
+        renderArrangementOptions(getRecordArrangementIds(record));
+        renderMembers(getRecordMemberIds(record));
+
+        highlightExisting.value = record.highlightPhotoUrl || "";
+        if (record.highlightPhotoUrl) showPreview(record.highlightPhotoUrl);
+
+        galleryItems = Array.isArray(record.galleryItems) ? record.galleryItems.map(item => ({ ...item })) : [];
+        baseGalleryKeys = new Set(galleryItems.map(galleryKey));
+        pendingGalleryFiles = [];
+        galleryPathsToDelete = [];
+        renderGalleryFiles();
+
+        linksList.replaceChildren();
+        (record.externalLinks?.length ? record.externalLinks : [{}]).forEach(addExternalLink);
+
+        if (kmcPerformanceMap && record.locationLat && record.locationLng) {
+            const position = { lat: Number(record.locationLat), lng: Number(record.locationLng) };
+            kmcPerformanceMap.setCenter(position);
+            kmcPerformanceMap.setZoom(16);
+            kmcPerformanceMarker.setPosition(position);
+        }
+
+        syncTbdStates();
+        formTitle.textContent = "Edit Performance";
+        submitButton.textContent = "Save Changes";
+        cancelButton.hidden = false;
+        setStatus();
+        openPerformanceModal();
+    }
+
+    async function deletePerformance(record) {
+        try { record = await window.KMCPerformanceList.detail(record, { fresh: true }); }
+        catch (error) { get("performance-preview-report").textContent = error.message || "Unable to load performance."; return; }
+        const label = `${formatDate(record.date)} performance`;
+        if (!await tools.confirmAction({ title:"Delete performance?", message:`Delete the ${label}? You can undo this for a few seconds.`, confirmText:"Delete" })) return;
+        try {
+            await db.collection("performances").doc(record.id).delete();
+            refreshPerformanceList();
+            if (idInput.value === record.id) resetForm();
+            await tools.logActivity(db, auth, "Deleted", "performance", record.id, label);
+            tools.showUndo(`${label} deleted.`, async () => {
+                const restored = { ...record }; delete restored.id;
+                await db.collection("performances").doc(record.id).set(restored);
+                refreshPerformanceList();
+                await tools.logActivity(db, auth, "Restored", "performance", record.id, label);
+            }, { onExpire: () => Promise.all([
+                tools.deleteStoragePath(storage, record.highlightPhotoPath),
+                ...(Array.isArray(record.galleryItems)
+                    ? record.galleryItems.flatMap(item => [item.path, item.thumbnailPath]).filter(Boolean).map(path => tools.deleteStoragePath(storage, path))
+                    : [])
+            ]) });
+        } catch (error) {
+            console.error("Unable to delete performance:", error);
+            setStatus("The performance could not be deleted.", "error");
+        }
+    }
+
+    let listRequest = null;
+    function refreshPerformanceList() {
+        if (listRequest) return listRequest;
+        listRequest = window.KMCPerformanceList.list().then(records => {
+            performanceRecords = records;
+            empty.textContent = "No performances have been added yet.";
+            renderPerformances();
+        }).catch(error => {
+            console.error("Unable to load performances:", error);
+            empty.hidden = false;
+            empty.textContent = "Performances could not be loaded. Refresh to try again.";
+        }).finally(() => { listRequest = null; });
+        return listRequest;
+    }
+    function subscribeToPerformances() {
+        refreshPerformanceList();
+        const refresh = () => { if (!document.hidden && auth.currentUser) refreshPerformanceList(); };
+        const timer = window.setInterval(refresh, 60000);
+        window.addEventListener("focus", refresh);
+        unsubscribePerformances = () => {
+            window.clearInterval(timer);
+            window.removeEventListener("focus", refresh);
+        };
+    }
+
+    async function uploadHighlight(documentId) {
+        const file = highlightInput.files[0];
+        if (!file) return null;
+        if (!imageOptimizer) throw new Error("The image optimizer could not be loaded. Refresh the page and try again.");
+        setStatus("Optimizing highlight image…");
+        const optimized = await imageOptimizer.optimize(file, {
+            maxWidth: 1800,
+            maxHeight: 1350,
+            quality: 0.82
+        });
+        setStatus(`Uploading optimized image (${imageOptimizer.formatBytes(optimized.optimizedBytes)})…`);
+        const path = `performance-highlights/${documentId}/${Date.now()}-${optimized.fileName}`;
+        const snapshot = await storage.ref(path).put(optimized.blob, {
+            contentType: optimized.contentType,
+            customMetadata: {
+                originalBytes: String(optimized.originalBytes),
+                optimizedBytes: String(optimized.optimizedBytes),
+                optimizedWidth: String(optimized.width),
+                optimizedHeight: String(optimized.height)
+            }
+        });
+        return { url: await snapshot.ref.getDownloadURL(), path, optimization: optimized };
+    }
+
+    auth.onAuthStateChanged(async (user) => {
+        if (!user) return returnToLogin();
+        try {
+            if (!await tools.verifyAdmin(auth, db, user)) {
+                await tools.signOut(auth);
+                return returnToLogin();
+            }
+            email.textContent = user.email || "Administrator";
+            loading.hidden = true;
+            page.hidden = false;
+            resetForm();
+            subscribeToPerformances();
+            await Promise.all([loadMembers(), loadArrangements()]);
+        } catch (error) {
+            console.error("Unable to verify administrator:", error);
+            loading.textContent = "Unable to verify administrator access. Check your connection and refresh.";
+        }
+    });
+
+    form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const documentId = idInput.value;
+        const arrangementIds = selectedValues("arrangements");
+        const arrangementNames = arrangementIds
+            .map((id) => arrangementRecords.find((item) => item.id === id))
+            .filter(Boolean)
+            .map(arrangementLabel);
+        const memberIds = selectedValues("members");
+        const members = memberIds.map(id => memberRecords.find(member => member.id === id)).filter(Boolean).map(member => member.name);
+        const links = externalLinks();
+
+        if (!dateInput.value) return setStatus("Enter a date.", "error");
+        if (!timeTbd.checked && !timeInput.value) return setStatus("Enter a time or select Time is TBD.", "error");
+        if (!locationTbd.checked && !locationInput.value.trim()) return setStatus("Choose a location or select Location is TBD.", "error");
+        if (!locationTbd.checked && !get("performance-location-name").value.trim()) {
+            return setStatus("Choose a location from the Google Maps suggestions.", "error");
+        }
+        if (!arrangementsTbd.checked && arrangementIds.length === 0) return setStatus("Select an arrangement or choose TBD.", "error");
+        if (!membersTbd.checked && memberIds.length === 0) return setStatus("Select attending members or choose TBD.", "error");
+        if (!highlightTbd.checked && !highlightInput.files[0] && !highlightExisting.value) return setStatus("Upload a highlight photo or choose TBD.", "error");
+        if (!linksTbd.checked && links.some((link) => !link.label || !link.url)) return setStatus("Each external link needs both a name and URL.", "error");
+
+        submitButton.disabled = true;
+        galleryDownloadButton.disabled = true;
+        cancelButton.disabled = true;
+        setStatus(documentId ? "Saving changes…" : "Adding performance…");
+
+        try {
+            const reference = documentId
+                ? db.collection("performances").doc(documentId)
+                : db.collection("performances").doc(uploadDraftId);
+            await ensureUploadCode(reference.id, !documentId);
+            const oldRecord = editingRecord || performanceRecords.find((record) => record.id === documentId) || {};
+
+            let highlightPhotoUrl = highlightTbd.checked ? "" : highlightExisting.value;
+            let highlightPhotoPath = highlightTbd.checked ? "" : oldRecord.highlightPhotoPath || "";
+            let imageOptimization = null;
+
+            const pathToDeleteAfterSave = (highlightTbd.checked || removeExistingHighlight) ? oldRecord.highlightPhotoPath || "" : "";
+            if (highlightTbd.checked || removeExistingHighlight) {
+                highlightPhotoUrl = "";
+                highlightPhotoPath = "";
+            }
+
+            if (!highlightTbd.checked && highlightInput.files[0]) {
+                const uploaded = await uploadHighlight(reference.id, oldRecord.highlightPhotoPath || "");
+                highlightPhotoUrl = uploaded.url;
+                highlightPhotoPath = uploaded.path;
+                imageOptimization = uploaded.optimization || null;
+                if (oldRecord.highlightPhotoPath && oldRecord.highlightPhotoPath !== uploaded.path) await tools.deleteStoragePath(storage, oldRecord.highlightPhotoPath);
+            }
+
+            const savedGallery = Array.isArray(galleryItems) ? galleryItems : [];
+            const nextGalleryItems = sortGalleryItems(await ensureGalleryThumbnails(reference.id, savedGallery));
+
+            const data = {
+                date: dateInput.value,
+                hidden: hiddenInput.checked,
+                time: timeTbd.checked ? "" : timeInput.value,
+                timeTbd: timeTbd.checked,
+                timezone: timeTbd.checked ? "" : timezoneInput.value,
+                // Keep the legacy location field for older pages, but store the
+                // place name and full address separately from now on.
+                location: locationTbd.checked ? "" : get("performance-location-name").value.trim(),
+                locationName: locationTbd.checked ? "" : get("performance-location-name").value.trim(),
+                locationAddress: locationTbd.checked ? "" : get("performance-location-address").value.trim(),
+                locationTbd: locationTbd.checked,
+                locationPlaceId: locationTbd.checked ? "" : get("performance-location-place-id").value,
+                locationLat: locationTbd.checked ? null : Number(get("performance-location-lat").value) || null,
+                locationLng: locationTbd.checked ? null : Number(get("performance-location-lng").value) || null,
+                arrangementIds: arrangementsTbd.checked ? [] : arrangementIds,
+                // Keep a readable snapshot for backwards compatibility; public pages resolve IDs first.
+                arrangements: arrangementsTbd.checked ? [] : arrangementNames,
+                arrangementsTbd: arrangementsTbd.checked,
+                memberIds: membersTbd.checked ? [] : memberIds,
+                members: membersTbd.checked ? [] : members,
+                membersTbd: membersTbd.checked,
+                highlightPhotoUrl,
+                highlightPhotoPath,
+                highlightTbd: highlightTbd.checked,
+                galleryItems: nextGalleryItems,
+                externalLinks: linksTbd.checked ? [] : links,
+                linksTbd: linksTbd.checked,
+                updatedAt: firebase.firestore.FieldValue.serverTimestamp()
+            };
+
+            if (documentId) {
+                // Keep community uploads that arrived while this editor was open.
+                await db.runTransaction(async transaction => {
+                    const current = await transaction.get(reference);
+                    if (!current.exists) throw new Error("This performance was deleted. Refresh to continue.");
+                    const nextKeys = new Set(nextGalleryItems.map(galleryKey));
+                    const newCommunityItems = (current.data().galleryItems || []).filter(item =>
+                        !baseGalleryKeys.has(galleryKey(item)) && !nextKeys.has(galleryKey(item)));
+                    transaction.update(reference, { ...data, galleryItems: sortGalleryItems([...nextGalleryItems, ...newCommunityItems]) });
+                });
+            } else {
+                data.createdAt = firebase.firestore.FieldValue.serverTimestamp();
+                await reference.set(data);
+            }
+            if (pathToDeleteAfterSave) await tools.deleteStoragePath(storage, pathToDeleteAfterSave);
+            await Promise.all(galleryPathsToDelete.map(path => tools.deleteStoragePath(storage, path)));
+            await tools.logActivity(db, auth, documentId ? "Updated" : "Created", "performance", reference.id, `${formatDate(data.date)} performance`);
+
+            resetForm();
+            refreshPerformanceList();
+            const savedMessage = documentId ? "Performance updated successfully." : "Performance added successfully.";
+            setStatus(imageOptimization ? `${savedMessage} ${imageOptimizer.summary(imageOptimization)}` : savedMessage, "success");
+            closePerformanceModal();
+        } catch (error) {
+            console.error("Unable to save performance:", error);
+            setStatus(error.message || "The performance could not be saved.", "error");
+        } finally {
+            submitButton.disabled = false;
+            galleryDownloadButton.disabled = !(galleryItems.length + pendingGalleryFiles.length);
+            cancelButton.disabled = false;
+        }
+    });
+
+    [timeTbd, locationTbd, arrangementsTbd, membersTbd, highlightTbd, linksTbd]
+        .forEach((checkbox) => checkbox.addEventListener("change", syncTbdStates));
+
+    highlightInput.addEventListener("change", () => {
+        const file = highlightInput.files[0];
+        if (!file) return;
+        clearPreview();
+        previewObjectUrl = URL.createObjectURL(file);
+        showPreview(previewObjectUrl);
+        removeExistingHighlight = false;
+    });
+
+    highlightRemove.addEventListener("click", () => {
+        highlightInput.value = "";
+        highlightExisting.value = "";
+        removeExistingHighlight = true;
+        clearPreview();
+    });
+
+    addLinkButton.addEventListener("click", () => addExternalLink());
+
+    addPerformanceButton?.addEventListener("click", () => {
+        resetForm();
+        showUploadCode();
+        openPerformanceModal(addPerformanceButton);
+    });
+
+    modalClose?.addEventListener("click", closePerformanceModal);
+    modal?.addEventListener("keydown", trapModalFocus);
+
+    // Dismiss the editor from its blurred backdrop.
+    modal?.querySelector(".performance-modal-backdrop")?.addEventListener("click", closePerformanceModal);
+    document.addEventListener("keydown", event => {
+        if (event.key === "Escape" && !event.defaultPrevented && !modal?.hidden && !document.querySelector("dialog[open]")) {
+            event.preventDefault(); closePerformanceModal();
+        }
+    });
+
+    cancelButton.addEventListener("click", () => {
+        resetForm();
+        closePerformanceModal();
+    });
+    logout.addEventListener("click", async () => {
+        logout.disabled = true;
+        if (unsubscribePerformances) unsubscribePerformances();
+        await tools.signOut(auth);
+        returnToLogin();
+    });
+    window.addEventListener("beforeunload", () => {
+        if (unsubscribePerformances) unsubscribePerformances();
+        if (previewObjectUrl) URL.revokeObjectURL(previewObjectUrl);
+    });
+});

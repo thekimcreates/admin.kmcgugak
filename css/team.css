@@ -1,0 +1,285 @@
+/* ========================================
+   KMC SAMULNORI — TEAM PAGE
+======================================== */
+
+.team-page {
+    min-height: 100vh;
+    overflow-x: hidden;
+}
+
+.team-page main {
+    position: relative;
+    z-index: 1;
+}
+
+.team-page .team-hero .hero-content h1 { margin-bottom: 0; }
+
+.team-hero-scroll {
+    position: absolute;
+    z-index: 3;
+    bottom: 34px;
+    left: 50%;
+    display: grid;
+    width: 54px;
+    height: 54px;
+    place-items: center;
+    border: 1px solid rgba(255, 255, 255, 0.45);
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.14);
+    box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.38), 0 10px 28px rgba(0, 0, 0, 0.24);
+    transform: translateX(-50%);
+    backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    animation: team-scroll-glow 2.4s ease-in-out infinite;
+}
+
+.team-hero-scroll span {
+    width: 12px;
+    height: 12px;
+    margin-top: -5px;
+    border-right: 2px solid #ffffff;
+    border-bottom: 2px solid #ffffff;
+    transform: rotate(45deg);
+    animation: team-scroll-arrow 2.4s ease-in-out infinite;
+}
+
+.team-hero-scroll:focus-visible { outline: 3px solid #ffffff; outline-offset: 4px; }
+
+@keyframes team-scroll-glow { 50% { box-shadow: 0 0 0 11px rgba(255, 255, 255, 0), 0 12px 34px rgba(0, 0, 0, 0.3); } }
+@keyframes team-scroll-arrow { 50% { transform: translateY(5px) rotate(45deg); } }
+
+/* Instructor */
+.instructor-section { padding: 112px 24px 132px; }
+
+.instructor-layout {
+    display: grid;
+    grid-template-columns: minmax(0, 0.92fr) minmax(0, 1.08fr);
+    gap: clamp(44px, 7vw, 92px);
+    align-items: start;
+}
+
+.instructor-photo-wrap {
+    position: sticky;
+    top: 118px;
+    overflow: hidden;
+    min-height: 640px;
+    border: 1px solid var(--glass-border);
+    border-radius: clamp(24px, 3vw, 36px);
+    background: var(--surface);
+    box-shadow: var(--shadow);
+}
+
+.instructor-photo {
+    display: block;
+    width: 100%;
+    height: 100%;
+    min-height: 640px;
+    object-fit: cover;
+}
+
+.instructor-copy {
+    padding-top: clamp(12px, 2vw, 28px);
+}
+
+.instructor-copy h2,
+.teacher-header h2,
+.members-header h2 {
+    margin: 0;
+    font-size: clamp(2.7rem, 5.5vw, 5rem);
+    font-weight: 800;
+    line-height: 0.96;
+    letter-spacing: -0.065em;
+}
+
+.teacher-header { margin-bottom: 48px; }
+
+.instructor-korean {
+    margin: 14px 0 42px;
+    color: var(--secondary-text);
+    font-size: clamp(1.15rem, 2vw, 1.45rem);
+    font-weight: 600;
+}
+
+.teacher-message {
+    padding-top: 34px;
+    border-top: 1px solid color-mix(in srgb, var(--text) 14%, transparent);
+}
+
+.teacher-message-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 20px;
+    margin-bottom: 22px;
+}
+
+.teacher-message h3 {
+    margin: 0;
+    font-size: clamp(1.4rem, 2.4vw, 2rem);
+    font-weight: 750;
+    letter-spacing: -0.035em;
+}
+
+.teacher-message-toggle {
+    display: inline-flex;
+    flex: 0 0 auto;
+    padding: 4px;
+    border: 1px solid color-mix(in srgb, var(--text) 14%, transparent);
+    border-radius: 999px;
+    background: var(--surface);
+}
+
+.teacher-message-toggle button {
+    min-height: 34px;
+    padding: 7px 12px;
+    border: 0;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--secondary-text);
+    font: inherit;
+    font-size: 0.82rem;
+    font-weight: 750;
+    cursor: pointer;
+}
+
+.teacher-message-toggle button[aria-selected="true"] {
+    background: var(--kmc-primary);
+    color: #ffffff;
+    box-shadow: 0 4px 12px rgba(139, 0, 0, 0.2);
+}
+
+.teacher-message-toggle button:focus-visible {
+    outline: 3px solid var(--accent);
+    outline-offset: 2px;
+}
+
+.teacher-message-panel[hidden] { display: none; }
+
+.teacher-message p {
+    margin: 0 0 22px;
+    color: var(--secondary-text);
+    font-size: clamp(1rem, 1.35vw, 1.15rem);
+    line-height: 1.8;
+}
+
+/* Members */
+.members-section {
+    padding: 0 24px 150px;
+}
+
+.members-header {
+    margin-bottom: 48px;
+}
+
+.members-grid {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: clamp(22px, 2.8vw, 34px);
+}
+
+.member-card {
+    overflow: hidden;
+    border: 1px solid var(--glass-border);
+    border-radius: clamp(22px, 2.3vw, 30px);
+    background: var(--surface);
+    box-shadow: 0 18px 48px rgba(0, 0, 0, 0.09);
+    transform: translateZ(0);
+    transition: transform 550ms var(--transition), box-shadow 550ms var(--transition);
+}
+
+.member-card > img {
+    display: block;
+    width: 100%;
+    aspect-ratio: 4 / 4.35;
+    object-fit: cover;
+    background: var(--surface);
+}
+
+.member-details {
+    padding: 24px 25px 27px;
+}
+
+.member-details h3 {
+    margin: 0 0 12px;
+    font-size: clamp(1.35rem, 2vw, 1.75rem);
+    font-weight: 750;
+    line-height: 1.08;
+    letter-spacing: -0.04em;
+}
+
+.member-details p {
+    margin: 5px 0 0;
+    color: var(--secondary-text);
+    font-size: 0.98rem;
+    font-weight: 550;
+    line-height: 1.45;
+}
+
+@media (max-width: 900px) {
+    .instructor-layout {
+        grid-template-columns: 1fr;
+        gap: 44px;
+    }
+
+    .instructor-photo-wrap {
+        position: relative;
+        top: auto;
+        min-height: 0;
+    }
+
+    .instructor-photo {
+        min-height: 0;
+        aspect-ratio: 4 / 4.5;
+    }
+
+    .members-grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+}
+
+@media (max-width: 600px) {
+    .instructor-section,
+    .members-section {
+        padding-right: 16px;
+        padding-left: 16px;
+    }
+
+    .instructor-section {
+        padding-top: 74px;
+        padding-bottom: 94px;
+    }
+
+    .members-section {
+        padding-bottom: 110px;
+    }
+
+    .members-header {
+        margin-bottom: 30px;
+    }
+
+    .teacher-header { margin-bottom: 30px; }
+
+    .members-grid {
+        grid-template-columns: 1fr;
+        gap: 24px;
+    }
+
+    .teacher-message-header {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+
+    .member-card > img {
+        aspect-ratio: 4 / 4.1;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .team-hero-scroll,
+    .team-hero-scroll span { animation: none; }
+}
+
+.team-loading-message {
+    grid-column: 1 / -1;
+    color: var(--secondary-text);
+}
